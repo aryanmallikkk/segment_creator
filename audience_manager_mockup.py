@@ -308,15 +308,6 @@ try:
         catalog = orchestrator.get_filter_catalog()
         st.session_state["_catalog_cache"] = catalog
 
-    with st.sidebar:
-        src = catalog.get("_source", "unknown")
-        saved = catalog.get("_saved_at", "")
-        st.caption(f"Catalog source: **{src}**" + (f"  \nSaved: {saved}" if saved else ""))
-        if st.button("🔄 Refresh catalog", help="Rebuilds from Algonomy API — update .env tokens first"):
-            orchestrator._catalog_cache = None
-            st.session_state["_catalog_cache"] = None
-            st.session_state["_suggestion_cache"] = {}
-            st.rerun()
 except Exception as ex:  # noqa: BLE001
     st.error(f"Failed loading filter catalog: {ex}")
     st.stop()
