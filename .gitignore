@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+algonomy_catalog_snapshot.json
+catalog_preview.txt
+gemini_catalog_preview.txt
+gemini_full_prompt.txt
+sts/
