@@ -31,7 +31,17 @@ class SegmentResult:
 
 
 def _load_env_file() -> None:
-    """Load key=value pairs from a local .env into process env if missing."""
+    """Load secrets into process env from .env file (local) or st.secrets (Streamlit Cloud)."""
+    # Streamlit Cloud: pull from st.secrets if available
+    try:
+        import streamlit as st
+        for k, v in st.secrets.items():
+            if isinstance(v, str) and k not in os.environ:
+                os.environ[k] = v
+    except Exception:
+        pass
+
+    # Local: read .env file
     env_path = Path(__file__).with_name(".env")
     if not env_path.exists():
         return
