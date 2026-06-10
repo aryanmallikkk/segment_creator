@@ -14,6 +14,17 @@ from segment_orchestrator import (
 
 st.set_page_config(page_title="Audience Manager", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    #MainMenu { visibility: hidden; }
+    footer { visibility: hidden; }
+    [data-testid="stToolbar"] { visibility: hidden; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # ── Filter label display names (Algonomy field IDs fall back to title-cased key) ──
 _FILTER_LABELS: dict[str, str] = {
     "engagement_status": "Engagement Status",
