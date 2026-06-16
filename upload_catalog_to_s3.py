@@ -74,6 +74,38 @@ def main() -> None:
     local_path.write_text(catalog_json, encoding="utf-8")
     print(f"Local snapshot saved → {local_path}")
 
+    # ── Regenerate preview files ──────────────────────────────────────────────
+    try:
+        from algonomy_gemini_bridge import build_gemini_catalog_text
+        catalog_text = build_gemini_catalog_text(catalog)
+
+        preview_path = Path(__file__).with_name("catalog_preview.txt")
+        preview_path.write_text(catalog_text, encoding="utf-8")
+
+        gemini_preview_path = Path(__file__).with_name("gemini_catalog_preview.txt")
+        gemini_preview_path.write_text(catalog_text, encoding="utf-8")
+
+        sample_prompt = (
+            "=== SYSTEM PROMPT ===\n"
+            "You build audience segment rule sets for an Algonomy Audience Manager. "
+            "Output ONLY JSON in this exact shape:\n"
+            "{\"segments\":[{\"name\":\"...\",\"description\":\"...\","
+            "\"algonomy_rules\":[{\"type\":\"match|donotmatch|didactivity|didnotactivity\","
+            "\"event\":\"<dataset id>\",\"field\":\"<field id>\","
+            "\"operator\":\"<operator id from catalog>\","
+            "\"value\":\"<value, list, or null>\"}]}]}\n\n"
+            "=== USER MESSAGE ===\n"
+            "Create segments from this user request.\n"
+            "Request:\nfemale customers with gold loyalty tier\n\n"
+            f"Available catalog:\n{catalog_text}"
+        )
+        full_prompt_path = Path(__file__).with_name("gemini_full_prompt.txt")
+        full_prompt_path.write_text(sample_prompt, encoding="utf-8")
+
+        print(f"Preview files updated → catalog_preview.txt, gemini_catalog_preview.txt, gemini_full_prompt.txt")
+    except Exception as ex:
+        print(f"Warning: Could not regenerate preview files: {ex}", file=sys.stderr)
+
     # ── Upload to S3 ─────────────────────────────────────────────────────────
     try:
         import boto3
@@ -103,7 +135,6 @@ def main() -> None:
                     Bucket=bucket,
                     CreateBucketConfiguration={"LocationConstraint": region},
                 )
-            # Block all public access (safe default)
             s3.put_public_access_block(
                 Bucket=bucket,
                 PublicAccessBlockConfiguration={

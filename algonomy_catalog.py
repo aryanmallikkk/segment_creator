@@ -277,6 +277,8 @@ def build_catalog(client: AlgonomyClient | None = None) -> dict[str, Any]:
         file=sys.stderr, flush=True,
     )
 
+    _enrich_fields_with_operators(client, catalog)
+
     return {
         "catalog": catalog,
         "field_store": field_store,
@@ -284,17 +286,76 @@ def build_catalog(client: AlgonomyClient | None = None) -> dict[str, Any]:
     }
 
 
+def _enrich_fields_with_operators(client: AlgonomyClient, catalog: dict) -> None:
+    """
+    Enrich every field in the catalog with its operator list from getAttributeOptions.
+    Full params: metadataId, fieldName (display label), type=attribute, dimType, eventId.
+    Deduplicates by (metadataId, eventId, fieldId).
+    """
+    # (metadataId, eventId, fieldId) -> list of field dicts to update
+    triples: dict[tuple[str, str, str], list[dict]] = {}
+
+    for type_id, type_entry in catalog.items():
+        if type_entry.get("type") == "segment":
+            continue
+        if type_entry.get("type") == "direct":
+            event_id = client.dim_type
+            for f in type_entry.get("fields") or []:
+                triples.setdefault((type_id, event_id, f["id"]), []).append(f)
+        elif type_entry.get("type") == "events":
+            for event in type_entry.get("events") or []:
+                event_id = event["id"]
+                for f in event.get("fields") or []:
+                    triples.setdefault((type_id, event_id, f["id"]), []).append(f)
+
+    print(
+        f"[Catalog] Enriching {len(triples)} (type, event, field) combos with operator metadata...",
+        file=sys.stderr, flush=True,
+    )
+
+    for i, ((meta_id, event_id, field_id), field_dicts) in enumerate(triples.items(), start=1):
+        try:
+            opts = client.get(
+                "/getAttributeOptions",
+                params={
+                    "metadataId": meta_id,
+                    "fieldName": field_id,
+                    "type": "attribute",
+                    "dimType": client.dim_type,
+                    "eventId": event_id,
+                },
+            )
+            operators = [op["id"] for op in opts.get("operators", []) if op.get("id")]
+        except Exception as ex:
+            print(
+                f"[Catalog]   {meta_id}/{event_id}/{field_id}: failed — {ex}",
+                file=sys.stderr, flush=True,
+            )
+            operators = []
+
+        for fd in field_dicts:
+            fd["operators"] = operators
+
+        if i % 50 == 0:
+            print(f"[Catalog]   {i}/{len(triples)} combos enriched...", file=sys.stderr, flush=True)
+
+    print("[Catalog] Operator enrichment complete.", file=sys.stderr, flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Query-time helpers (called per query, not at startup)
 # ---------------------------------------------------------------------------
 
-def get_attribute_options(client: AlgonomyClient, field_id: str) -> dict[str, Any]:
+def get_attribute_options(client: AlgonomyClient, field_id: str, metadata_id: str = "") -> dict[str, Any]:
     """
     Fetch operator metadata for a specific field.
     Called at query time after Gemini selects a field.
     Returns operators list, isSearchable, dataType, etc.
     """
-    return client.get("/getAttributeOptions", params={"attributeId": field_id})
+    params: dict = {"fieldName": field_id}
+    if metadata_id:
+        params["metadataId"] = metadata_id
+    return client.get("/getAttributeOptions", params=params)
 
 
 def get_child_attribute_options(

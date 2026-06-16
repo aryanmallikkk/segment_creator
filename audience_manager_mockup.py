@@ -49,7 +49,13 @@ _FILTER_LABELS: dict[str, str] = {
     "channel_name": "Channel",
 }
 
-_OPERATOR_OPTIONS = ["equals", "not_equals", "contains", "gte", "lte", "between", "in_last_days", "in_list"]
+_OPERATOR_OPTIONS = [
+    "EQ", "NEQ", "IN", "NOTIN",
+    "CONTAINS", "NOTCONTAINS", "STARTSWITH", "ENDSWITH",
+    "GT", "GTE", "LT", "LTE", "BETWEEN",
+    "IN_LAST_DAYS", "IN_LAST_MONTHS",
+    "NOTNULL", "NULL", "ALL",
+]
 _TYPE_ICONS = {"match": "🟢", "donotmatch": "🔴", "didactivity": "🔵", "didnotactivity": "🟠"}
 
 
@@ -57,18 +63,20 @@ _TYPE_ICONS = {"match": "🟢", "donotmatch": "🔴", "didactivity": "🔵", "di
 
 def _parse_rule_value(op: str, raw: str) -> Any:
     """Coerce a user-typed string value to the right Python type for an Algonomy rule operator."""
-    if op in ("in_list", "between") and "," in raw:
+    if op in ("NOTNULL", "NULL", "ALL"):
+        return None
+    if op in ("IN", "NOTIN", "BETWEEN") and "," in raw:
         parts = [p.strip() for p in raw.split(",") if p.strip()]
         try:
             return [float(p) if "." in p else int(p) for p in parts]
         except ValueError:
             return parts
-    if op == "in_last_days":
+    if op in ("IN_LAST_DAYS", "IN_LAST_MONTHS"):
         try:
             return int(raw)
         except ValueError:
             return raw
-    if op in ("gte", "lte"):
+    if op in ("GT", "GTE", "LT", "LTE"):
         try:
             return float(raw)
         except ValueError:
@@ -111,7 +119,7 @@ def _show_manual_filter_summary(blocks: list[dict[str, Any]], operator: str) -> 
             for rule in alg_rules:
                 icon = _TYPE_ICONS.get(rule.get("type", "match"), "⚪")
                 st.markdown(
-                    f"{icon} `{rule.get('event','')}` → `{rule.get('field','')}` "
+                    f"{icon} `{_event_label(event_label_map, rule.get('event',''))}` → `{_field_label(field_label_map, rule.get('field',''))}` "
                     f"**{rule.get('operator','')}** {rule.get('value','')}"
                 )
         return
@@ -178,7 +186,7 @@ def _render_suggestions(
                     for r in sug_alg_rules:
                         icon = _TYPE_ICONS.get(r.get("type", "match"), "⚪")
                         st.caption(
-                            f"{icon} `{r.get('event','')}`.`{r.get('field','')}` "
+                            f"{icon} `{_event_label(event_label_map, r.get('event',''))}`.`{_field_label(field_label_map, r.get('field',''))}` "
                             f"{r.get('operator','')} {r.get('value','')}"
                         )
                 if st.button("Apply", key=f"apply_sug_{idx}_{s_idx}", use_container_width=True):
@@ -203,10 +211,10 @@ def _render_filter_editor(
             new_rules = []
             for i, rule in enumerate(algonomy_rules):
                 rtype = rule.get("type", "match")
-                op    = rule.get("operator", "equals")
+                op    = rule.get("operator", "EQ")
                 val   = rule.get("value", "")
                 icon  = _TYPE_ICONS.get(rtype, "⚪")
-                st.markdown(f"{icon} **{rtype}** · `{rule.get('event','')}` → `{rule.get('field','')}`")
+                st.markdown(f"{icon} **{rtype}** · `{_event_label(event_label_map, rule.get('event',''))}` → `{_field_label(field_label_map, rule.get('field',''))}`")
                 col_op, col_val = st.columns([1, 2])
                 with col_op:
                     new_op = st.selectbox(
@@ -276,6 +284,44 @@ def _get_attr_groups(catalog: dict[str, Any]) -> tuple[list[dict[str, Any]], lis
     return [], []
 
 
+def _build_field_label_map(catalog: dict[str, Any]) -> dict[str, str]:
+    """Map every Algonomy field id -> its display label, across all types/events."""
+    label_map: dict[str, str] = {}
+    alg_catalog = catalog.get("catalog", {})
+    for type_entry in alg_catalog.values():
+        for f in type_entry.get("fields") or []:
+            fid = f.get("id")
+            if fid:
+                label_map[fid] = f.get("label", fid)
+        for ev in type_entry.get("events") or []:
+            for f in ev.get("fields") or []:
+                fid = f.get("id")
+                if fid:
+                    label_map[fid] = f.get("label", fid)
+    return label_map
+
+
+def _field_label(field_label_map: dict[str, str], field_id: str) -> str:
+    return field_label_map.get(field_id, field_id)
+
+
+def _build_event_label_map(catalog: dict[str, Any]) -> dict[str, str]:
+    """Map every Algonomy event/dataset id -> its display label, across all types."""
+    label_map: dict[str, str] = {}
+    alg_catalog = catalog.get("catalog", {})
+    for type_id, type_entry in alg_catalog.items():
+        label_map.setdefault(type_id, type_entry.get("label", type_id))
+        for ev in type_entry.get("events") or []:
+            eid = ev.get("id")
+            if eid:
+                label_map[eid] = ev.get("label", eid)
+    return label_map
+
+
+def _event_label(event_label_map: dict[str, str], event_id: str) -> str:
+    return event_label_map.get(event_id, event_id)
+
+
 # ── State ────────────────────────────────────────────────────────────────────
 
 def _init_state() -> None:
@@ -313,6 +359,8 @@ except Exception as ex:  # noqa: BLE001
     st.stop()
 
 customer_attrs, sales_attrs = _get_attr_groups(catalog)
+field_label_map = _build_field_label_map(catalog)
+event_label_map = _build_event_label_map(catalog)
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
 
@@ -335,10 +383,10 @@ with builder_manual:
                 _rtype  = _rule.get("type", "match")
                 _revent = _rule.get("event", "")
                 _rfield = _rule.get("field", "")
-                _rop    = _rule.get("operator", "equals")
+                _rop    = _rule.get("operator", "EQ")
                 _rval   = _rule.get("value", "")
                 _icon   = _TYPE_ICONS.get(_rtype, "⚪")
-                st.markdown(f"{_icon} `{_revent}` → `{_rfield}`")
+                st.markdown(f"{_icon} `{_event_label(event_label_map, _revent)}` → `{_field_label(field_label_map, _rfield)}`")
                 _rc1, _rc2 = st.columns([1, 2])
                 with _rc1:
                     _new_op = st.selectbox(
@@ -492,7 +540,7 @@ with builder_claude:
                             icon = _TYPE_ICONS.get(rtype, "⚪")
                             st.markdown(
                                 f"{icon} **{rtype}** &nbsp;·&nbsp; "
-                                f"`{rule.get('event','')}` → `{rule.get('field','')}` "
+                                f"`{_event_label(event_label_map, rule.get('event',''))}` → `{_field_label(field_label_map, rule.get('field',''))}` "
                                 f"&nbsp; {rule.get('operator','')} &nbsp; **{rule.get('value','')}**"
                             )
 

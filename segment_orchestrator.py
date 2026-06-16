@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from algonomy_gemini_bridge import build_gemini_catalog_text, is_algonomy_catalog
+from algonomy_gemini_bridge import build_gemini_catalog_text, fix_rule_types, is_algonomy_catalog
 
 # Plain-text icons for Algonomy rule types used in Gemini prompts (ASCII-safe)
 _TYPE_ICONS_PLAIN = {
@@ -165,7 +165,7 @@ def _gemini_get_segment_suggestions(
                 "text": (
                     "You are a segment refinement advisor for an Algonomy Audience Manager. "
                     "Suggest 4-6 useful rule additions to narrow or expand the audience. "
-                    "Use ONLY field ids and dataset ids from the catalog below. "
+                    "Use ONLY field ids, dataset ids, and operator ids from the catalog below. "
                     "Respond ONLY with JSON in this exact shape:\n"
                     "{\"suggestions\":[{"
                     "\"label\":\"...\","
@@ -174,8 +174,8 @@ def _gemini_get_segment_suggestions(
                     "\"type\":\"match|donotmatch|didactivity|didnotactivity\","
                     "\"event\":\"<dataset id>\","
                     "\"field\":\"<field id>\","
-                    "\"operator\":\"equals|not_equals|contains|gte|lte|between|in_last_days|in_list\","
-                    "\"value\":\"<value>\""
+                    "\"operator\":\"<operator id from catalog>\","
+                    "\"value\":\"<value, list, or null>\""
                     "}]}]}"
                 )
             }]
@@ -216,7 +216,11 @@ def _gemini_get_segment_suggestions(
         try:
             parsed = json.loads(candidate)
             if isinstance(parsed, dict) and isinstance(parsed.get("suggestions"), list):
-                return parsed["suggestions"]
+                suggestions = parsed["suggestions"]
+                for sug in suggestions:
+                    if sug.get("algonomy_rules"):
+                        sug["algonomy_rules"] = fix_rule_types(sug["algonomy_rules"], filter_catalog)
+                return suggestions
         except (json.JSONDecodeError, TypeError):
             continue
     raise RuntimeError(f"Could not parse suggestions from Gemini response: {text[:400]}")
@@ -249,28 +253,45 @@ def _claude_generate_segment_filters(
         "\"type\":\"match|donotmatch|didactivity|didnotactivity\","
         "\"event\":\"<dataset id>\","
         "\"field\":\"<field id>\","
-        "\"operator\":\"equals|not_equals|contains|gte|lte|between|in_last_days|in_list\","
-        "\"value\":\"<value or list>\""
+        "\"operator\":\"<operator id from catalog>\","
+        "\"value\":\"<value, list, or null if operator needs no value>\""
         "}]"
         "}]}\n"
         "Rules:\n"
-        "- Use ONLY field ids and dataset ids from the provided catalog.\n"
+        "- Use ONLY field ids, dataset ids, and operator ids from the provided catalog.\n"
         "- 'type' must be one of: match, donotmatch, didactivity, didnotactivity.\n"
-        "- Use 'match' for profile/demographic/behavioural properties.\n"
-        "- Use 'didactivity' for browsing/transaction events (product_view, add_to_cart, etc.).\n"
-        "- For recency/days: use in_last_days with an integer value.\n"
-        "- For numeric ranges: use between with value=[min, max].\n"
+        "- Use 'match'/'donotmatch' for profile and aggregate properties (e.g. profile_data, "
+        "fct_sale_transaction) — datasets WITHOUT a 'Happened'/event-time field.\n"
+        "- Use 'didactivity'/'didnotactivity' ONLY for real browsing/engagement activity events "
+        "(e.g. product_view, add_to_cart, transaction_complete) — datasets WITH a 'Happened' field.\n"
+        "- Never pair a dataset with a 'type' it isn't listed as 'valid for' in the catalog.\n"
+        "- Negation matters: 'did NOT do X' / 'haven't done X' / 'no X' on an activity event → "
+        "'didnotactivity', not 'didactivity'. Likewise 'is NOT' / 'does NOT match' on a profile/aggregate "
+        "property → 'donotmatch', not 'match'. Pick the positive or negative type based on the wording, "
+        "not just the dataset.\n"
+        "- For recency: use IN_LAST_DAYS with an integer value.\n"
+        "- For numeric ranges: use BETWEEN with value=[min, max].\n"
+        "- For list membership: use IN with value=[v1, v2, ...].\n"
+        "- For no-value operators (NOTNULL, NULL, ALL): set value to null.\n"
         "- If the request is ambiguous, call request_clarification instead of guessing.\n"
         "- Do NOT include customer_filters or sales_filters — only algonomy_rules."
     )
     user_content_suffix = (
         "\n\nExamples:\n"
-        "  'women over 30' → type=match, event=profile_data, field=gender, operator=equals, value=F\n"
-        "  'bought something last 30 days' → type=didactivity, event=transaction_complete, "
-        "field=sale_trans_date::total_visits, operator=in_last_days, value=30\n"
-        "  'loyalty tier gold' → type=match, event=profile_data, field=loyalty_tier, operator=equals, value=Gold\n"
+        "  'women' → type=match, event=profile_data, field=gender, operator=EQ, value=F\n"
+        "  'bought something last 30 days' → type=match, event=fct_sale_transaction, "
+        "field=sale_trans_date, operator=IN_LAST_DAYS, value=30\n"
+        "  'loyalty tier gold' → type=match, event=profile_data, field=loyalty_tier, operator=EQ, value=Gold\n"
         "  'spent more than 1000' → type=match, event=fct_sale_transaction, "
-        "field=sale_trans_net_val::total_order_value, operator=gte, value=1000"
+        "field=sale_trans_net_val, operator=GTE, value=1000\n"
+        "  'in gold or platinum tier' → type=match, event=profile_data, field=loyalty_tier, "
+        "operator=IN, value=[Gold, Platinum]\n"
+        "  'never purchased' → type=donotmatch, event=fct_sale_transaction, "
+        "field=sale_trans_date, operator=NOTNULL, value=null\n"
+        "  'viewed a product in the last 7 days' → type=didactivity, event=product_view, "
+        "field=event_time, operator=LASTXDAYS, value=7\n"
+        "  'havent transacted in the last 30 days' / 'no purchase in 30 days' → "
+        "type=didnotactivity, event=transaction_complete, field=event_time, operator=LASTXDAYS, value=30"
     )
 
     clarification_tool = {
@@ -500,6 +521,10 @@ class AudienceOrchestrator:
     def _results_from_generated(
         self, user_prompt: str, generated: list[dict[str, Any]], source: str
     ) -> list[SegmentResult]:
+        catalog = self.get_filter_catalog()
+        for seg in generated:
+            if seg.get("algonomy_rules"):
+                seg["algonomy_rules"] = fix_rule_types(seg["algonomy_rules"], catalog)
         generated = _dedupe_segments(generated)
         if not generated:
             return [
