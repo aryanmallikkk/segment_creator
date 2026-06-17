@@ -603,6 +603,7 @@ class AudienceOrchestrator:
         self, user_prompt: str, catalog: dict[str, Any] | None = None
     ) -> list[SegmentResult]:
         catalog = catalog or self.get_filter_catalog()
+        self._catalog_cache = catalog
         source = "claude"
 
         generated, clarification, generation_error = _claude_generate_segment_filters(
@@ -635,6 +636,7 @@ class AudienceOrchestrator:
         catalog: dict[str, Any] | None = None,
     ) -> list[SegmentResult]:
         catalog = catalog or self.get_filter_catalog()
+        self._catalog_cache = catalog
         source = "claude"
         generated, clarification, generation_error = _claude_generate_segment_filters(
             user_prompt,
