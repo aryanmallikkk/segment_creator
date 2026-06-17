@@ -7,3 +7,4 @@ catalog_preview.txt
 gemini_catalog_preview.txt
 gemini_full_prompt.txt
 sts/
+.claude/
