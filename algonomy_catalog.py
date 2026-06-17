@@ -326,15 +326,23 @@ def _enrich_fields_with_operators(client: AlgonomyClient, catalog: dict) -> None
                 },
             )
             operators = [op["id"] for op in opts.get("operators", []) if op.get("id")]
+            vl_info = opts.get("valueListInfo") or {}
+            value_list = (
+                [item["code"] for item in vl_info.get("valueList", []) if item.get("code")]
+                if opts.get("valueListPresent") else []
+            )
         except Exception as ex:
             print(
                 f"[Catalog]   {meta_id}/{event_id}/{field_id}: failed — {ex}",
                 file=sys.stderr, flush=True,
             )
             operators = []
+            value_list = []
 
         for fd in field_dicts:
             fd["operators"] = operators
+            if value_list:
+                fd["valueList"] = value_list
 
         if i % 50 == 0:
             print(f"[Catalog]   {i}/{len(triples)} combos enriched...", file=sys.stderr, flush=True)
