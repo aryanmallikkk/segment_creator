@@ -12,6 +12,14 @@ from segment_orchestrator import (
 )
 
 
+def _fetch_count(rules: list[dict]) -> int:
+    try:
+        from algonomy_client import AlgonomyClient
+        return AlgonomyClient().get_count(rules)
+    except Exception:
+        return -1
+
+
 st.set_page_config(page_title="Audience Manager", layout="wide")
 
 st.markdown(
@@ -60,6 +68,59 @@ _TYPE_ICONS = {"match": "🟢", "donotmatch": "🔴", "didactivity": "🔵", "di
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+# Resolution config for hasChild fields
+_CHILD_RESOLUTION = {
+    "brand": {
+        "label": "Brand name",
+        "field": "product_brand",
+        "group_id": "product_attribute_frm_master",
+        "api": "search_child_attribute",
+    },
+    "category": {
+        "label": "Category",
+        "field": "product_category_code",
+        "group_id": "map_product_category",
+        "api": "search_child_attribute",
+    },
+    "product": {
+        "label": "Specific product",
+        "field": "product_code",
+        "group_id": None,
+        "api": "search_attribute",
+    },
+}
+
+
+def _build_haschild_set(catalog: dict) -> set[str]:
+    """Return set of field ids that have hasChild=True across all catalog events."""
+    result = set()
+    for type_data in catalog.get("catalog", {}).values():
+        for event in type_data.get("events", []):
+            for field in event.get("fields", []):
+                if field.get("hasChild"):
+                    result.add(field["id"])
+    return result
+
+
+def _needs_resolution(rule: dict, haschild_fields: set[str]) -> bool:
+    """True if rule uses a hasChild field with a plain text value."""
+    if rule.get("field") not in haschild_fields:
+        return False
+    val = rule.get("value")
+    if not val or not isinstance(val, str):
+        return False
+    # Skip values that are already codes (numeric, bool, date-like, empty)
+    v = val.strip()
+    if not v or v.lower() in ("true", "false", "null"):
+        return False
+    try:
+        float(v)
+        return False
+    except ValueError:
+        pass
+    return True
+
 
 def _parse_rule_value(op: str, raw: str) -> Any:
     """Coerce a user-typed string value to the right Python type for an Algonomy rule operator."""
@@ -111,11 +172,13 @@ def _show_manual_filter_summary(blocks: list[dict[str, Any]], operator: str) -> 
     alg_rules: list[dict] = st.session_state.get("manual_algonomy_rules") or []
     if alg_rules:
         seg_name = st.session_state.get("manual_algonomy_segment_name", "")
+        manual_count = st.session_state.get("manual_algonomy_count", -1)
+        count_str = f" · {manual_count:,} customers" if manual_count >= 0 else ""
         with st.container(border=True):
             if seg_name:
-                st.markdown(f"🤖 **{seg_name}** — {len(alg_rules)} rule(s)")
+                st.markdown(f"🤖 **{seg_name}** — {len(alg_rules)} rule(s){count_str}")
             else:
-                st.markdown(f"🤖 **Algonomy rules** — {len(alg_rules)} rule(s)")
+                st.markdown(f"🤖 **Algonomy rules** — {len(alg_rules)} rule(s){count_str}")
             for rule in alg_rules:
                 icon = _TYPE_ICONS.get(rule.get("type", "match"), "⚪")
                 st.markdown(
@@ -238,7 +301,8 @@ def _render_filter_editor(
                 results = st.session_state.claude_generated
                 if 0 < idx <= len(results):
                     results[idx - 1].selected_filters["algonomy_rules"] = new_rules
-                st.success("Rules updated. ⏳ Count will refresh when getCount API is connected.")
+                    with st.spinner("Fetching count..."):
+                        results[idx - 1].count = _fetch_count(new_rules)
                 st.rerun()
             return
 
@@ -322,6 +386,184 @@ def _event_label(event_label_map: dict[str, str], event_id: str) -> str:
     return event_label_map.get(event_id, event_id)
 
 
+# ── Resolution widget ────────────────────────────────────────────────────────
+
+def _render_resolution_widget(seg_idx: int, rule_idx: int, rule: dict, result: Any, all_rules: list[dict]) -> None:
+    val = rule.get("value", "")
+    key_type   = f"resolve_type_{seg_idx}_{rule_idx}"
+    key_results = f"resolve_results_{seg_idx}_{rule_idx}"
+    key_picked = f"resolve_picked_{seg_idx}_{rule_idx}"
+
+    with st.container():
+        st.caption(f"⚠️ Resolve **'{val}'** — what does this refer to?")
+        col_type, col_search = st.columns([1, 2])
+
+        with col_type:
+            res_type = st.radio(
+                "Type",
+                options=list(_CHILD_RESOLUTION.keys()),
+                format_func=lambda k: _CHILD_RESOLUTION[k]["label"],
+                key=key_type,
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+
+        with col_search:
+            if st.button("Search", key=f"resolve_search_{seg_idx}_{rule_idx}"):
+                try:
+                    from algonomy_client import AlgonomyClient
+                    client = AlgonomyClient()
+                    cfg = _CHILD_RESOLUTION[res_type]
+                    metadata_id = rule.get("type", "didactivity")
+                    event_id = rule.get("event", "transaction_complete")
+
+                    if cfg["api"] == "search_child_attribute":
+                        items = client.search_child_attribute(
+                            field_name=cfg["field"],
+                            parent_attribute_id="product_code",
+                            group_id=cfg["group_id"],
+                            search_text=val,
+                            metadata_id=metadata_id,
+                            event_id=event_id,
+                        )
+                    elif cfg["api"] == "search_lookup_values":
+                        items = client.search_lookup_values(
+                            field_name=cfg["field"],
+                            parent_attribute_id="product_code",
+                            group_id=cfg["group_id"],
+                            metadata_id=metadata_id,
+                            event_id=event_id,
+                        )
+                        # client-side filter by search text
+                        items = [i for i in items if val.lower() in i.get("desc", "").lower()][:50]
+                    else:
+                        items = client.search_attribute(
+                            field_name=cfg["field"],
+                            search_text=val,
+                            metadata_id=metadata_id,
+                            event_id=event_id,
+                        )
+                    st.session_state[key_results] = items
+                    st.session_state.pop(key_picked, None)
+                except Exception as ex:
+                    st.error(f"Search failed: {ex}")
+
+        results = st.session_state.get(key_results)
+        if results is not None:
+            if not results:
+                st.warning(f"No results found for '{val}' as {_CHILD_RESOLUTION[res_type]['label']}.")
+            else:
+                options = [f"{i['desc']} ({i['code']})" for i in results]
+                col_sel, col_all = st.columns([4, 1])
+                with col_all:
+                    if st.button("Select all", key=f"resolve_all_{seg_idx}_{rule_idx}"):
+                        st.session_state[key_picked] = options
+                with col_sel:
+                    picked_labels = st.multiselect(
+                        "Pick value(s)",
+                        options,
+                        default=st.session_state.get(key_picked, []),
+                        key=key_picked,
+                        label_visibility="collapsed",
+                    )
+                if st.button("Apply", key=f"resolve_apply_{seg_idx}_{rule_idx}"):
+                    picked_labels = st.session_state.get(key_picked) or []
+                    if not picked_labels:
+                        st.warning("Select at least one value.")
+                        st.stop()
+                    picked_codes = [results[options.index(lbl)]["code"] for lbl in picked_labels]
+                    cfg = _CHILD_RESOLUTION[st.session_state[key_type]]
+                    operator = "IN" if len(picked_codes) > 1 else "EQ"
+                    value = picked_codes if len(picked_codes) > 1 else picked_codes[0]
+                    new_rule = {
+                        **rule,
+                        "field": cfg["field"],
+                        "operator": operator,
+                        "value": value,
+                        "parentAttributeId": "product_code",
+                        "groupId": cfg["group_id"],
+                    }
+                    gens = st.session_state.claude_generated
+                    if 0 < seg_idx <= len(gens):
+                        rules = list(gens[seg_idx - 1].selected_filters.get("algonomy_rules", []))
+                        rules[rule_idx] = new_rule
+                        gens[seg_idx - 1].selected_filters["algonomy_rules"] = rules
+                        # Only fetch count when all rules in this segment are resolved
+                        still_pending = any(_needs_resolution(r, haschild_fields) for r in rules)
+                        if not still_pending:
+                            with st.spinner("Fetching count..."):
+                                gens[seg_idx - 1].count = _fetch_count(rules)
+                    # clear resolution state
+                    st.session_state.pop(key_results, None)
+                    st.session_state.pop(key_picked, None)
+                    st.rerun()
+
+
+# ── Auto-resolve helpers ─────────────────────────────────────────────────────
+
+def _try_auto_resolve(rule: dict) -> dict | None:
+    """Search brand → category → product. Returns a fully resolved rule or None."""
+    val = rule.get("value", "")
+    metadata_id = rule.get("type", "didactivity")
+    event_id = rule.get("event", "transaction_complete")
+    try:
+        from algonomy_client import AlgonomyClient
+        client = AlgonomyClient()
+        for res_key in ("brand", "category", "product"):
+            cfg = _CHILD_RESOLUTION[res_key]
+            if cfg["api"] == "search_child_attribute":
+                items = client.search_child_attribute(
+                    field_name=cfg["field"],
+                    parent_attribute_id="product_code",
+                    group_id=cfg["group_id"],
+                    search_text=val,
+                    metadata_id=metadata_id,
+                    event_id=event_id,
+                )
+            else:
+                items = client.search_attribute(
+                    field_name=cfg["field"],
+                    search_text=val,
+                    metadata_id=metadata_id,
+                    event_id=event_id,
+                )
+            if items:
+                codes = [i["code"] for i in items]
+                operator = "IN" if len(codes) > 1 else "EQ"
+                value = codes if len(codes) > 1 else codes[0]
+                return {
+                    **rule,
+                    "field": cfg["field"],
+                    "operator": operator,
+                    "value": value,
+                    "parentAttributeId": "product_code",
+                    "groupId": cfg["group_id"],
+                    "_auto_resolved_as": res_key,
+                }
+    except Exception as ex:
+        import sys
+        print(f"[auto_resolve] Failed for '{val}': {ex}", file=sys.stderr)
+    return None
+
+
+def _auto_resolve_all(results: list, haschild_fields: set[str]) -> None:
+    """Run auto-resolution on every pending rule across all segments in-place."""
+    for result in results:
+        rules = list(result.selected_filters.get("algonomy_rules") or [])
+        changed = False
+        for ri, rule in enumerate(rules):
+            if _needs_resolution(rule, haschild_fields):
+                resolved = _try_auto_resolve(rule)
+                if resolved:
+                    rules[ri] = resolved
+                    changed = True
+        if changed:
+            result.selected_filters["algonomy_rules"] = rules
+            still_pending = any(_needs_resolution(r, haschild_fields) for r in rules)
+            if not still_pending:
+                result.count = _fetch_count(rules)
+
+
 # ── State ────────────────────────────────────────────────────────────────────
 
 def _init_state() -> None:
@@ -333,6 +575,8 @@ def _init_state() -> None:
         "_catalog_cache": None,
         "manual_algonomy_rules": [],
         "manual_algonomy_segment_name": "",
+        "manual_algonomy_count": -1,
+        "auto_resolve_mode": True,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -361,6 +605,7 @@ except Exception as ex:  # noqa: BLE001
 customer_attrs, sales_attrs = _get_attr_groups(catalog)
 field_label_map = _build_field_label_map(catalog)
 event_label_map = _build_event_label_map(catalog)
+haschild_fields = _build_haschild_set(catalog)
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
 
@@ -410,11 +655,13 @@ with builder_manual:
             _mb1, _mb2 = st.columns(2)
             if _mb1.button("Save rule changes", key="manual_alg_save", use_container_width=True):
                 st.session_state.manual_algonomy_rules = _edited_rules
-                st.success("Rules updated. ⏳ Count pending getCount API integration.")
+                with st.spinner("Fetching count..."):
+                    st.session_state.manual_algonomy_count = _fetch_count(_edited_rules)
                 st.rerun()
             if _mb2.button("Clear loaded rules", key="manual_alg_clear", use_container_width=True):
                 st.session_state.manual_algonomy_rules = []
                 st.session_state.manual_algonomy_segment_name = ""
+                st.session_state.manual_algonomy_count = -1
                 st.rerun()
 
     tab_match, tab_not_match, tab_activity, tab_not_activity, tab_segment, tab_not_segment = st.tabs(
@@ -486,8 +733,23 @@ with builder_claude:
         height=220,
     )
 
-    if st.button("Auto-create segments with Gemini", type="primary", use_container_width=True):
-        st.session_state.claude_generated = orchestrator.create_segments(user_prompt, catalog=catalog)
+    resolve_col, btn_col = st.columns([1, 2])
+    with resolve_col:
+        auto_resolve = st.toggle(
+            "Auto-resolve",
+            value=st.session_state.get("auto_resolve_mode", True),
+            key="auto_resolve_mode",
+            help="ON: automatically resolve brand/category/product references. OFF: pick manually.",
+        )
+    with btn_col:
+        generate_clicked = st.button("Auto-create segments with Gemini", type="primary", use_container_width=True)
+
+    if generate_clicked:
+        with st.spinner("Generating segments..."):
+            st.session_state.claude_generated = orchestrator.create_segments(user_prompt, catalog=catalog)
+        if st.session_state.get("auto_resolve_mode", True):
+            with st.spinner("Auto-resolving product references..."):
+                _auto_resolve_all(st.session_state.claude_generated, haschild_fields)
         st.session_state["_suggestion_cache"] = {}
 
     if st.session_state.claude_generated:
@@ -517,7 +779,8 @@ with builder_claude:
                     )
             else:
                 if algonomy_rules:
-                    expander_title = f"{idx}. {result.name}  ·  ⏳ count pending"
+                    count_label = f"{result.count:,}" if result.count >= 0 else "⏳"
+                    expander_title = f"{idx}. {result.name}  ·  {count_label} customers"
                 else:
                     expander_title = f"{idx}. {result.name}"
 
@@ -535,14 +798,19 @@ with builder_claude:
                 if not is_clarification:
                     if algonomy_rules:
                         st.markdown("**Selected rules:**")
-                        for rule in algonomy_rules:
+                        for ri, rule in enumerate(algonomy_rules):
                             rtype = rule.get("type", "match")
                             icon = _TYPE_ICONS.get(rtype, "⚪")
+                            auto_tag = f" _(auto: {rule['_auto_resolved_as']})_" if rule.get("_auto_resolved_as") else ""
                             st.markdown(
                                 f"{icon} **{rtype}** &nbsp;·&nbsp; "
                                 f"`{_event_label(event_label_map, rule.get('event',''))}` → `{_field_label(field_label_map, rule.get('field',''))}` "
-                                f"&nbsp; {rule.get('operator','')} &nbsp; **{rule.get('value','')}**"
+                                f"&nbsp; {rule.get('operator','')} &nbsp; **{rule.get('value','')}**{auto_tag}"
                             )
+                            if _needs_resolution(rule, haschild_fields):
+                                if st.session_state.get("auto_resolve_mode", True):
+                                    st.caption(f"⚠️ Could not auto-resolve **'{rule.get('value')}'** — resolve manually below.")
+                                _render_resolution_widget(idx, ri, rule, result, algonomy_rules)
 
                 if result.error:
                     options = clarification_payload.get("options")

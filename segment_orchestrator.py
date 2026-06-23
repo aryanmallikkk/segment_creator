@@ -274,7 +274,12 @@ def _claude_generate_segment_filters(
         "- For list membership: use IN with value=[v1, v2, ...].\n"
         "- For no-value operators (NOTNULL, NULL, ALL): set value to null.\n"
         "- If the request is ambiguous, call request_clarification instead of guessing.\n"
-        "- Do NOT include customer_filters or sales_filters — only algonomy_rules."
+        "- Do NOT include customer_filters or sales_filters — only algonomy_rules.\n"
+        "- When the user mentions a product name, brand, or category (e.g. 'Nike', 'shoes', 'Nike shoes'), "
+        "use field=product_code with operator=CONTAINS and the term as the value. "
+        "If the user mentions BOTH a brand AND a category (e.g. 'Nike shoes'), generate TWO separate rules: "
+        "one with value=brand-term and one with value=category-term. "
+        "Do not combine them into one rule."
     )
     user_content_suffix = (
         "\n\nExamples:\n"
@@ -291,7 +296,11 @@ def _claude_generate_segment_filters(
         "  'viewed a product in the last 7 days' → type=didactivity, event=product_view, "
         "field=event_time, operator=LASTXDAYS, value=7\n"
         "  'havent transacted in the last 30 days' / 'no purchase in 30 days' → "
-        "type=didnotactivity, event=transaction_complete, field=event_time, operator=LASTXDAYS, value=30"
+        "type=didnotactivity, event=transaction_complete, field=event_time, operator=LASTXDAYS, value=30\n"
+        "  'bought Nike' → type=didactivity, event=transaction_complete, field=product_code, operator=CONTAINS, value=Nike\n"
+        "  'bought Nike shoes' → TWO rules: "
+        "(type=didactivity, event=transaction_complete, field=product_code, operator=CONTAINS, value=Nike) AND "
+        "(type=didactivity, event=transaction_complete, field=product_code, operator=CONTAINS, value=shoes)"
     )
 
     clarification_tool = {
@@ -526,6 +535,12 @@ class AudienceOrchestrator:
             if seg.get("algonomy_rules"):
                 seg["algonomy_rules"] = fix_rule_types(seg["algonomy_rules"], catalog)
         generated = _dedupe_segments(generated)
+
+        try:
+            from algonomy_client import AlgonomyClient
+            _count_client: AlgonomyClient | None = AlgonomyClient()
+        except Exception:
+            _count_client = None
         if not generated:
             return [
                 SegmentResult(
@@ -545,6 +560,16 @@ class AudienceOrchestrator:
             description = seg.get("description", "")
             algonomy_rules = seg.get("algonomy_rules")
             if algonomy_rules:
+                # Skip getCount if any rule uses CONTAINS on a product field (needs resolution first)
+                needs_resolution = any(
+                    r.get("operator") == "CONTAINS" and "product" in r.get("field", "")
+                    for r in algonomy_rules
+                )
+                count = (
+                    _count_client.get_count(algonomy_rules)
+                    if _count_client and not needs_resolution
+                    else -1
+                )
                 results.append(
                     SegmentResult(
                         name=name,
@@ -554,7 +579,7 @@ class AudienceOrchestrator:
                             "customer_filters": {},
                             "sales_filters": {},
                         },
-                        count=-1,   # -1 = pending execution via getCount API
+                        count=count,
                         rows=[],
                         source=source,
                         error=None,
