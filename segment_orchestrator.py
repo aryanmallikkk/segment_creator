@@ -201,6 +201,8 @@ def _gemini_get_segment_suggestions(
         raise RuntimeError(err)
     if not raw:
         raise RuntimeError("Gemini returned an empty response.")
+    import sys as _sys
+    print(f"[Gemini suggestions] response:\n{json.dumps(raw, indent=2)}", file=_sys.stderr)
     text = _gemini_extract_text(raw)
     if not text:
         raise RuntimeError(f"Gemini response had no text. Full response: {json.dumps(raw)[:500]}")
@@ -254,7 +256,8 @@ def _claude_generate_segment_filters(
         "\"event\":\"<dataset id>\","
         "\"field\":\"<field id>\","
         "\"operator\":\"<operator id from catalog>\","
-        "\"value\":\"<value, list, or null if operator needs no value>\""
+        "\"value\":\"<value, list, or null if operator needs no value>\","
+        "\"resolution_hint\":\"brand|category|product|attribute\""
         "}]"
         "}]}\n"
         "Rules:\n"
@@ -275,10 +278,14 @@ def _claude_generate_segment_filters(
         "- For no-value operators (NOTNULL, NULL, ALL): set value to null.\n"
         "- If the request is ambiguous, call request_clarification instead of guessing.\n"
         "- Do NOT include customer_filters or sales_filters — only algonomy_rules.\n"
-        "- When the user mentions a product name, brand, or category (e.g. 'Nike', 'shoes', 'Nike shoes'), "
-        "use field=product_code with operator=CONTAINS and the term as the value. "
-        "If the user mentions BOTH a brand AND a category (e.g. 'Nike shoes'), generate TWO separate rules: "
-        "one with value=brand-term and one with value=category-term. "
+        "- When the user mentions a product name, brand, category, or product attribute (e.g. 'Nike', 'shoes', "
+        "'red color', 'size M'), use field=product_code with operator=CONTAINS and the term as the value. "
+        "Always set resolution_hint to classify what the term refers to:\n"
+        "  resolution_hint=brand      → a company/label name (Nike, Puma, Samsung)\n"
+        "  resolution_hint=category   → a type/class of product (shoes, tomato, milk, electronics)\n"
+        "  resolution_hint=product    → a specific named item (iPhone 15, Lay's Classic)\n"
+        "  resolution_hint=attribute  → a product property/descriptor (red, size M, cotton, waterproof)\n"
+        "If the user mentions multiple terms (e.g. 'Puma red shoes'), generate ONE rule per term. "
         "Do not combine them into one rule."
     )
     user_content_suffix = (
@@ -297,10 +304,13 @@ def _claude_generate_segment_filters(
         "field=event_time, operator=LASTXDAYS, value=7\n"
         "  'havent transacted in the last 30 days' / 'no purchase in 30 days' → "
         "type=didnotactivity, event=transaction_complete, field=event_time, operator=LASTXDAYS, value=30\n"
-        "  'bought Nike' → type=didactivity, event=transaction_complete, field=product_code, operator=CONTAINS, value=Nike\n"
+        "  'bought Nike' → type=didactivity, event=transaction_complete, field=product_code, operator=CONTAINS, value=Nike, resolution_hint=brand\n"
         "  'bought Nike shoes' → TWO rules: "
-        "(type=didactivity, event=transaction_complete, field=product_code, operator=CONTAINS, value=Nike) AND "
-        "(type=didactivity, event=transaction_complete, field=product_code, operator=CONTAINS, value=shoes)"
+        "(field=product_code, value=Nike, resolution_hint=brand) AND (field=product_code, value=shoes, resolution_hint=category)\n"
+        "  'interacted with Puma red shoes' → THREE rules: "
+        "(field=product_code, value=Puma, resolution_hint=brand), "
+        "(field=product_code, value=red, resolution_hint=attribute), "
+        "(field=product_code, value=shoes, resolution_hint=category)"
     )
 
     clarification_tool = {
@@ -361,6 +371,9 @@ def _claude_generate_segment_filters(
     if call_error:
         return None, None, call_error
     assert raw is not None
+
+    import sys as _sys
+    print(f"[Gemini segment] response:\n{json.dumps(raw, indent=2)}", file=_sys.stderr)
 
     try:
         response_parts = raw["candidates"][0]["content"]["parts"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from typing import Any
 
 import streamlit as st
@@ -75,18 +76,27 @@ _CHILD_RESOLUTION = {
         "label": "Brand name",
         "field": "product_brand",
         "group_id": "product_attribute_frm_master",
+        "group_name": "Product attribute master",
+        "display_name": "Brand",
+        "parent": "product_code",
         "api": "search_child_attribute",
     },
     "category": {
         "label": "Category",
         "field": "product_category_code",
         "group_id": "map_product_category",
+        "group_name": "Category",
+        "display_name": "Category",
+        "parent": "product_code",
         "api": "search_child_attribute",
     },
     "product": {
         "label": "Specific product",
         "field": "product_code",
         "group_id": None,
+        "group_name": None,
+        "display_name": "Product",
+        "parent": None,
         "api": "search_attribute",
     },
 }
@@ -181,9 +191,11 @@ def _show_manual_filter_summary(blocks: list[dict[str, Any]], operator: str) -> 
                 st.markdown(f"🤖 **Algonomy rules** — {len(alg_rules)} rule(s){count_str}")
             for rule in alg_rules:
                 icon = _TYPE_ICONS.get(rule.get("type", "match"), "⚪")
+                _fd0 = _rule_field_display(field_label_map, rule)
                 st.markdown(
-                    f"{icon} `{_event_label(event_label_map, rule.get('event',''))}` → `{_field_label(field_label_map, rule.get('field',''))}` "
-                    f"**{rule.get('operator','')}** {rule.get('value','')}"
+                    f"{icon} `{_event_label(event_label_map, rule.get('event',''))}` → `{_fd0}` "
+                    f"**{operator_label_map.get(rule.get('operator',''), rule.get('operator',''))}** "
+                    f"{value_label_map.get(rule.get('field',''), {}).get(str(rule.get('value','')), rule.get('value',''))}"
                 )
         return
 
@@ -277,7 +289,8 @@ def _render_filter_editor(
                 op    = rule.get("operator", "EQ")
                 val   = rule.get("value", "")
                 icon  = _TYPE_ICONS.get(rtype, "⚪")
-                st.markdown(f"{icon} **{rtype}** · `{_event_label(event_label_map, rule.get('event',''))}` → `{_field_label(field_label_map, rule.get('field',''))}`")
+                _fd = _rule_field_display(field_label_map, rule)
+                st.markdown(f"{icon} **{rtype}** · `{_event_label(event_label_map, rule.get('event',''))}` → `{_fd}`")
                 col_op, col_val = st.columns([1, 2])
                 with col_op:
                     new_op = st.selectbox(
@@ -367,6 +380,44 @@ def _build_field_label_map(catalog: dict[str, Any]) -> dict[str, str]:
 
 def _field_label(field_label_map: dict[str, str], field_id: str) -> str:
     return field_label_map.get(field_id, field_id)
+
+
+def _rule_field_display(field_label_map: dict[str, str], rule: dict) -> str:
+    """Return a human-readable field label for a rule, respecting attribute hierarchy."""
+    hierarchy = rule.get("_field_hierarchy")
+    if hierarchy:
+        parts = [_field_label(field_label_map, hierarchy[0])] + [p for p in hierarchy[1:] if p]
+        return " › ".join(parts)
+    return rule.get("_field_display") or _field_label(field_label_map, rule.get("field", ""))
+
+
+def _build_operator_label_map(catalog: dict[str, Any]) -> dict[str, str]:
+    """Map operator id -> displayText, built from all fields in the catalog."""
+    label_map: dict[str, str] = {}
+    for type_entry in catalog.get("catalog", {}).values():
+        for ev in type_entry.get("events") or []:
+            for f in ev.get("fields") or []:
+                for op in f.get("operators") or []:
+                    if isinstance(op, dict) and op.get("id"):
+                        label_map.setdefault(op["id"], op.get("displayText", op["id"]))
+    return label_map
+
+
+def _build_value_label_map(catalog: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """Map field_id -> {code -> desc} for fields with a valueList."""
+    label_map: dict[str, dict[str, str]] = {}
+    for type_entry in catalog.get("catalog", {}).values():
+        for ev in type_entry.get("events") or []:
+            for f in ev.get("fields") or []:
+                fid = f.get("id")
+                vl = f.get("valueList") or []
+                if fid and vl:
+                    if fid not in label_map:
+                        label_map[fid] = {}
+                    for item in vl:
+                        if isinstance(item, dict) and item.get("code"):
+                            label_map[fid].setdefault(item["code"], item.get("desc", item["code"]))
+    return label_map
 
 
 def _build_event_label_map(catalog: dict[str, Any]) -> dict[str, str]:
@@ -501,47 +552,145 @@ def _render_resolution_widget(seg_idx: int, rule_idx: int, rule: dict, result: A
 
 # ── Auto-resolve helpers ─────────────────────────────────────────────────────
 
+def _gemini_identify_attribute(val: str, attributes: list[dict]) -> dict | None:
+    """Ask Gemini which attribute field best matches the term. Returns the attribute dict or None."""
+    import urllib.request as _req, json as _json
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    model   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    if not api_key or not attributes:
+        return None
+    product_attrs = [
+        a for a in attributes
+        if a.get("groupId") == "product_attribute_child" and a.get("display") == "true"
+    ]
+    if not product_attrs:
+        return None
+    attr_lines = "\n".join(
+        f"- id={a['id']} displayName={a.get('displayName', a['id'])}"
+        for a in product_attrs
+    )
+    prompt = (
+        f"A user searched for '{val}' as a product attribute (e.g. color, size, material, style).\n"
+        f"Pick the single best matching attribute from this list:\n{attr_lines}\n"
+        "Reply with ONLY the id value (e.g. tag_123). If none match, reply: none."
+    )
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    url  = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    try:
+        request = _req.Request(
+            url, data=_json.dumps(body).encode(), headers={"content-type": "application/json"}, method="POST"
+        )
+        with _req.urlopen(request, timeout=10) as resp:
+            raw  = _json.loads(resp.read().decode())
+            import sys as _sys
+            print(f"[Gemini identify_attribute] response:\n{_json.dumps(raw, indent=2)}", file=_sys.stderr)
+            text = raw["candidates"][0]["content"]["parts"][0]["text"].strip()
+            for a in product_attrs:
+                if a["id"] in text:
+                    return a
+    except Exception:
+        pass
+    return None
+
+
 def _try_auto_resolve(rule: dict) -> dict | None:
-    """Search brand → category → product. Returns a fully resolved rule or None."""
-    val = rule.get("value", "")
+    """Use resolution_hint from Gemini rule, then call the single matching API."""
+    import sys
+    val         = rule.get("value", "")
     metadata_id = rule.get("type", "didactivity")
-    event_id = rule.get("event", "transaction_complete")
+    event_id    = rule.get("event", "transaction_complete")
+    res_type    = rule.get("resolution_hint", "category")
+
+    if res_type not in _CHILD_RESOLUTION and res_type != "attribute":
+        res_type = "category"
+
+    print(f"[auto_resolve] '{val}' → {res_type} (from hint)", file=sys.stderr)
+
     try:
         from algonomy_client import AlgonomyClient
         client = AlgonomyClient()
-        for res_key in ("brand", "category", "product"):
-            cfg = _CHILD_RESOLUTION[res_key]
-            if cfg["api"] == "search_child_attribute":
-                items = client.search_child_attribute(
-                    field_name=cfg["field"],
-                    parent_attribute_id="product_code",
-                    group_id=cfg["group_id"],
-                    search_text=val,
-                    metadata_id=metadata_id,
-                    event_id=event_id,
-                )
-            else:
-                items = client.search_attribute(
-                    field_name=cfg["field"],
-                    search_text=val,
-                    metadata_id=metadata_id,
-                    event_id=event_id,
-                )
-            if items:
-                codes = [i["code"] for i in items]
-                operator = "IN" if len(codes) > 1 else "EQ"
-                value = codes if len(codes) > 1 else codes[0]
-                return {
-                    **rule,
-                    "field": cfg["field"],
-                    "operator": operator,
-                    "value": value,
-                    "parentAttributeId": "product_code",
-                    "groupId": cfg["group_id"],
-                    "_auto_resolved_as": res_key,
-                }
+
+        if res_type == "attribute":
+            attrs   = client.get_child_attributes(metadata_id, event_id)
+            matched = _gemini_identify_attribute(val, attrs)
+            if not matched:
+                print(f"[auto_resolve] No attribute matched for '{val}'", file=sys.stderr)
+                return None
+            field_id = matched["id"]
+            group_id = matched.get("groupId", "product_attribute_child")
+            items = client.search_child_attribute(
+                field_name=field_id,
+                parent_attribute_id="product_code",
+                group_id=group_id,
+                search_text=val,
+                metadata_id=metadata_id,
+                event_id=event_id,
+            )
+            if not items:
+                print(f"[auto_resolve] No values for '{val}' in attribute {field_id}", file=sys.stderr)
+                return None
+            codes    = [i["code"] for i in items]
+            descs    = [i.get("desc", i["code"]) for i in items]
+            operator = "IN" if len(codes) > 1 else "EQ"
+            value    = codes if len(codes) > 1 else codes[0]
+            return {
+                **rule,
+                "field": field_id,
+                "operator": operator,
+                "value": value,
+                "_display_value": descs if len(descs) > 1 else descs[0],
+                "_field_hierarchy": [
+                    "product_code",
+                    matched.get("groupName", ""),
+                    matched.get("displayName", field_id),
+                ],
+                "parentAttributeId": "product_code",
+                "groupId": group_id,
+                "_auto_resolved_as": f"attribute ({matched.get('displayName', field_id)})",
+            }
+
+        cfg = _CHILD_RESOLUTION[res_type]
+        if cfg["api"] == "search_child_attribute":
+            items = client.search_child_attribute(
+                field_name=cfg["field"],
+                parent_attribute_id="product_code",
+                group_id=cfg["group_id"],
+                search_text=val,
+                metadata_id=metadata_id,
+                event_id=event_id,
+            )
+        else:
+            items = client.search_attribute(
+                field_name=cfg["field"],
+                search_text=val,
+                metadata_id=metadata_id,
+                event_id=event_id,
+            )
+
+        if not items:
+            print(f"[auto_resolve] No results for '{val}' as {res_type}", file=sys.stderr)
+            return None
+
+        codes    = [i["code"] for i in items]
+        descs    = [i.get("desc", i["code"]) for i in items]
+        operator = "IN" if len(codes) > 1 else "EQ"
+        value    = codes if len(codes) > 1 else codes[0]
+        hierarchy = [p for p in [cfg.get("parent"), cfg.get("group_name"), cfg.get("display_name")] if p]
+        resolved = {
+            **rule,
+            "field": cfg["field"],
+            "operator": operator,
+            "value": value,
+            "_display_value": descs if len(descs) > 1 else descs[0],
+            "_field_hierarchy": hierarchy if len(hierarchy) > 1 else None,
+            "groupId": cfg["group_id"],
+            "_auto_resolved_as": res_type,
+        }
+        if cfg.get("parent"):
+            resolved["parentAttributeId"] = cfg["parent"]
+        return resolved
+
     except Exception as ex:
-        import sys
         print(f"[auto_resolve] Failed for '{val}': {ex}", file=sys.stderr)
     return None
 
@@ -576,7 +725,6 @@ def _init_state() -> None:
         "manual_algonomy_rules": [],
         "manual_algonomy_segment_name": "",
         "manual_algonomy_count": -1,
-        "auto_resolve_mode": True,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -587,6 +735,7 @@ def _init_state() -> None:
 
 _init_state()
 orchestrator = AudienceOrchestrator()
+
 
 # ── Load catalog ──────────────────────────────────────────────────────────────
 
@@ -603,9 +752,11 @@ except Exception as ex:  # noqa: BLE001
     st.stop()
 
 customer_attrs, sales_attrs = _get_attr_groups(catalog)
-field_label_map = _build_field_label_map(catalog)
-event_label_map = _build_event_label_map(catalog)
-haschild_fields = _build_haschild_set(catalog)
+field_label_map    = _build_field_label_map(catalog)
+event_label_map    = _build_event_label_map(catalog)
+operator_label_map = _build_operator_label_map(catalog)
+value_label_map    = _build_value_label_map(catalog)
+haschild_fields    = _build_haschild_set(catalog)
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
 
@@ -631,7 +782,8 @@ with builder_manual:
                 _rop    = _rule.get("operator", "EQ")
                 _rval   = _rule.get("value", "")
                 _icon   = _TYPE_ICONS.get(_rtype, "⚪")
-                st.markdown(f"{_icon} `{_event_label(event_label_map, _revent)}` → `{_field_label(field_label_map, _rfield)}`")
+                _fd2 = _rule_field_display(field_label_map, _rule)
+                st.markdown(f"{_icon} `{_event_label(event_label_map, _revent)}` → `{_fd2}`")
                 _rc1, _rc2 = st.columns([1, 2])
                 with _rc1:
                     _new_op = st.selectbox(
@@ -802,10 +954,22 @@ with builder_claude:
                             rtype = rule.get("type", "match")
                             icon = _TYPE_ICONS.get(rtype, "⚪")
                             auto_tag = f" _(auto: {rule['_auto_resolved_as']})_" if rule.get("_auto_resolved_as") else ""
+                            display_val = rule.get("_display_value") or rule.get("value", "")
+                            if not isinstance(display_val, list):
+                                fid = rule.get("field", "")
+                                display_val = value_label_map.get(fid, {}).get(str(display_val), display_val)
+                            if isinstance(display_val, list):
+                                fid = rule.get("field", "")
+                                vmap = value_label_map.get(fid, {})
+                                display_val = ", ".join(vmap.get(str(v), str(v)) for v in display_val)
+                            op_id = rule.get("operator", "")
+                            op_label = operator_label_map.get(op_id, op_id)
+                            field_display = _rule_field_display(field_label_map, rule)
+                            val_part = f" &nbsp; **{display_val}**" if display_val not in (None, "", "None", []) else ""
                             st.markdown(
                                 f"{icon} **{rtype}** &nbsp;·&nbsp; "
-                                f"`{_event_label(event_label_map, rule.get('event',''))}` → `{_field_label(field_label_map, rule.get('field',''))}` "
-                                f"&nbsp; {rule.get('operator','')} &nbsp; **{rule.get('value','')}**{auto_tag}"
+                                f"`{_event_label(event_label_map, rule.get('event',''))}` → `{field_display}` "
+                                f"&nbsp; {op_label}{val_part}{auto_tag}"
                             )
                             if _needs_resolution(rule, haschild_fields):
                                 if st.session_state.get("auto_resolve_mode", True):

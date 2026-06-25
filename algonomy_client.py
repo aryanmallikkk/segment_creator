@@ -156,7 +156,7 @@ class AlgonomyClient:
                     "type": "attribute",
                     "fieldName": "cs_event_id::count_cs_event_id",
                     "operatorSelected": "GT",
-                    "values": ["0::0"],
+                    "values": ["0"],
                 }
 
             rule_blocks[block_id] = {
@@ -177,9 +177,19 @@ class AlgonomyClient:
 
     @staticmethod
     def _fmt_values(value: Any, operator: str) -> list:
-        """Format rule value(s) into Algonomy's val::val wire format."""
+        """Format rule value(s) into Algonomy's wire format.
+
+        Numeric comparison operators (GT/GTE/LT/LTE) use plain values.
+        BETWEEN uses min::max.
+        Everything else (EQ/IN/CONTAINS etc.) uses val::val for categorical fields.
+        """
         if operator in ("NOTNULL", "NULL", "ALL") or value is None:
             return []
+
+        # Numeric comparisons — plain value, no :: duplication
+        if operator in ("GT", "GTE", "LT", "LTE", "LASTXDAYS", "IN_LAST_DAYS", "IN_LAST_MONTHS"):
+            v = value[0] if isinstance(value, list) else value
+            return [str(v)]
 
         def _enc(v) -> str:
             s = str(v)
@@ -187,7 +197,7 @@ class AlgonomyClient:
 
         if isinstance(value, list):
             if operator == "BETWEEN" and len(value) == 2:
-                return [f"{value[0]}::{value[1]}"]
+                return [str(value[0]), str(value[1])]
             return [_enc(v) for v in value]
         return [_enc(value)]
 
@@ -226,6 +236,21 @@ class AlgonomyClient:
             return result.get("valueList", [])
         except Exception as ex:
             print(f"[searchChildAttribute] Failed: {ex}", file=sys.stderr)
+            return []
+
+    def get_child_attributes(self, metadata_id: str, event_id: str,
+                             parent_attribute_id: str = "product_code") -> list[dict]:
+        """Return available child attributes for a parent field (brand, category, tags, etc.)."""
+        try:
+            result = self.get("/getChildAttributes", {
+                "dimType": self.dim_type,
+                "metadataId": metadata_id,
+                "eventId": event_id,
+                "parentAttributeId": parent_attribute_id,
+            })
+            return result.get("attributes", [])
+        except Exception as ex:
+            print(f"[getChildAttributes] Failed: {ex}", file=sys.stderr)
             return []
 
     def search_lookup_values(self, field_name: str, parent_attribute_id: str, group_id: str,

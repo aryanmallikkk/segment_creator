@@ -128,10 +128,20 @@ def build_gemini_catalog_text(algonomy_catalog: dict[str, Any]) -> str:
             lines.append(f"    {group_name}:")
             for f in gfields:
                 ops = f.get("operators") or []
-                ops_str = f"  [{', '.join(ops)}]" if ops else ""
+                ops_str = (
+                    "  [" + ", ".join(
+                        f"{o['id']} ({o['displayText']})" if isinstance(o, dict) and o['id'] != o.get('displayText') else (o['id'] if isinstance(o, dict) else o)
+                        for o in ops
+                    ) + "]"
+                ) if ops else ""
                 child_note = "  ← has sub-fields" if f.get("hasChild") else ""
                 vl = f.get("valueList") or []
-                vl_str = f"  values: {vl}" if vl else ""
+                vl_str = (
+                    "  values: " + ", ".join(
+                        f"{v['code']} ({v['desc']})" if isinstance(v, dict) else str(v)
+                        for v in vl
+                    )
+                ) if vl else ""
                 lines.append(f"      {f['id']}  ({f['label']}){ops_str}{vl_str}{child_note}")
 
     lines.append("")

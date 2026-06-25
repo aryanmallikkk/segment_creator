@@ -325,10 +325,16 @@ def _enrich_fields_with_operators(client: AlgonomyClient, catalog: dict) -> None
                     "eventId": event_id,
                 },
             )
-            operators = [op["id"] for op in opts.get("operators", []) if op.get("id")]
+            operators = [
+                {"id": op["id"], "displayText": op.get("displayText", op["id"])}
+                for op in opts.get("operators", []) if op.get("id")
+            ]
             vl_info = opts.get("valueListInfo") or {}
             value_list = (
-                [item["code"] for item in vl_info.get("valueList", []) if item.get("code")]
+                [
+                    {"code": item["code"], "desc": item.get("desc", item["code"])}
+                    for item in vl_info.get("valueList", []) if item.get("code")
+                ]
                 if opts.get("valueListPresent") else []
             )
         except Exception as ex:
